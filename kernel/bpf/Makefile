@@ -33,6 +33,7 @@ ifeq ($(CONFIG_BPF_JIT),y)
 obj-$(CONFIG_BPF_SYSCALL) += bpf_struct_ops.o
 obj-${CONFIG_BPF_LSM} += bpf_lsm.o
 endif
+obj-$(CONFIG_BPF_PRELOAD) += preload/
 
 # TODO(https://bugs.llvm.org/show_bug.cgi?id=45030) false positive in UBSAN,
 # re-enable UBSAN once the bug is fixed.
