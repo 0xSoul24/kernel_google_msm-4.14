@@ -128,6 +128,4 @@ config QCA_CLD_WLAN
 	help
 	  Add support for the Qualcomm Atheros CLD WLAN module.
 
-source "drivers/staging/erofs/Kconfig"
-
 endif # STAGING
