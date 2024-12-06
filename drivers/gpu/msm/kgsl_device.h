@@ -1,4 +1,5 @@
 /* Copyright (c) 2002,2007-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -329,7 +330,7 @@ struct kgsl_device {
 	struct kgsl_pwrscale pwrscale;
 
 	int reset_counter; /* Track how many GPU core resets have occurred */
-	struct workqueue_struct *events_wq;
+	struct kthread_worker *events_worker;
 
 	struct device *busmondev; /* pseudo dev for GPU BW voting governor */
 
