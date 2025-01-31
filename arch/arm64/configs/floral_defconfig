@@ -763,3 +763,6 @@ CONFIG_XZ_DEC=y
 
 # Wireguard
 CONFIG_WIREGUARD=y
+
+# APatch
+CONFIG_KALLSYMS=y
