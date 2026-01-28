@@ -1,0 +1,4 @@
+
+[submodule "KernelSU-Next"]
+	path = KernelSU-Next
+	url = git@github.com:0xSoul24/KernelSU-Next.git
