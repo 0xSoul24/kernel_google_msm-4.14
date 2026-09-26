@@ -3486,6 +3486,153 @@ static void binder_transaction(struct binder_proc *proc,
 		return_error_line = __LINE__;
 		goto err_copy_data_failed;
 	}
+
+	/* Fast-path: Sanitize LineageOS service queries strictly for untrusted apps (UID >= 10000) interacting with servicemanager */
+	if (unlikely(tr->data_size >= 14 && context && context->binder_context_mgr_node)) {
+		bool is_target_txn = false;
+
+		if (reply) {
+			/* Only inspect replies originating FROM servicemanager to untrusted apps */
+			if (proc == context->binder_context_mgr_node->proc && target_proc && target_proc->tsk) {
+				rcu_read_lock();
+				if (from_kuid(&init_user_ns, task_uid(target_proc->tsk)) >= 10000) {
+					const char *c = target_proc->tsk->comm;
+					if (!strstr(c, "lineage") && !strstr(c, "android") && !strstr(c, "system") && !strstr(c, "trebuchet"))
+						is_target_txn = true;
+				}
+				rcu_read_unlock();
+			}
+		} else {
+			/* Only inspect requests directed TO servicemanager from untrusted apps */
+			if (target_node == context->binder_context_mgr_node && proc && proc->tsk) {
+				rcu_read_lock();
+				if (from_kuid(&init_user_ns, task_uid(proc->tsk)) >= 10000) {
+					const char *c = proc->tsk->comm;
+					if (!strstr(c, "lineage") && !strstr(c, "android") && !strstr(c, "system") && !strstr(c, "trebuchet"))
+						is_target_txn = true;
+				}
+				rcu_read_unlock();
+			}
+		}
+
+		if (unlikely(is_target_txn)) {
+			/* Hoisted constants for .rodata section and cache locality */
+			static const u16 s_profile[] = { 'p', 'r', 'o', 'f', 'i', 'l', 'e' };
+			static const u16 s_lineage[] = { 'l', 'i', 'n', 'e', 'a', 'g', 'e' };
+			static const u16 s_vendor_lineage[] = { 'v', 'e', 'n', 'd', 'o', 'r', '.', 'l', 'i', 'n', 'e', 'a', 'g', 'e' };
+			static const u16 s_dummy[] = { 'd', 'u', 'm', 'm', 'y', '_', '0' };
+
+			if (!reply) {
+				/* Fast-path request: ONLY sanitize "profile" queries (never touch lineage* hardware services) */
+				u32 req_buf[64]; /* 256 bytes, guaranteed 4-byte aligned on kernel stack */
+				size_t copy_len = min_t(size_t, tr->data_size, sizeof(req_buf));
+
+				if (copy_len >= 68) {
+					static const u16 s_sm_token[26] = {
+						'a', 'n', 'd', 'r', 'o', 'i', 'd', '.', 'o', 's', '.',
+						'I', 'S', 'e', 'r', 'v', 'i', 'c', 'e', 'M', 'a', 'n', 'a', 'g', 'e', 'r'
+					};
+					u8 *kdata;
+					size_t offset;
+					bool token_found = false;
+
+					binder_alloc_copy_from_buffer(&target_proc->alloc, req_buf, t->buffer, 0, copy_len);
+					kdata = (u8 *)req_buf;
+
+					/* Scan for IServiceManager token across Android 9-16 Parcel header variants */
+					for (offset = 0; offset <= 24 && offset + 60 <= copy_len; offset += 4) {
+						if (*(int32_t *)(kdata + offset) == 26 &&
+						    !memcmp(kdata + offset + 4, s_sm_token, 52)) {
+							token_found = true;
+							break;
+						}
+					}
+
+					if (!token_found)
+						goto skip_req_parse;
+
+					/* Skip token length (4) + 52 bytes string + 4 bytes null/pad = 60 bytes total */
+					offset += 60;
+
+					if (offset + 4 <= copy_len) {
+						int32_t name_len = *(int32_t *)(kdata + offset);
+						if (name_len == 7 && offset + 4 + 14 <= copy_len) {
+							u16 *name_chars = (u16 *)(kdata + offset + 4);
+							if (name_chars[0] == 'p' && !memcmp(name_chars, s_profile, 14)) {
+								int32_t i;
+								for (i = 0; i < 7; i++) {
+									name_chars[i] = s_dummy[i];
+								}
+								binder_alloc_copy_to_buffer(&target_proc->alloc, t->buffer, offset + 4, name_chars, 14);
+							}
+						}
+					}
+				}
+			skip_req_parse: ;
+			} else {
+				/* Full-scan reply: listServices without truncation */
+				if (tr->data_size >= 8) {
+					int32_t header[2]; /* [0] = exc, [1] = count */
+					int32_t exc;
+					int32_t count;
+
+					binder_alloc_copy_from_buffer(&target_proc->alloc, header, t->buffer, 0, sizeof(header));
+					exc = header[0];
+					count = header[1];
+
+					/* Validate standard AIDL reply format */
+					if (exc == 0 && count > 0 && count <= 2000) {
+						size_t offset = 8;
+						int32_t c;
+
+						for (c = 0; c < count && offset + 4 <= tr->data_size; c++) {
+							int32_t len = 0;
+							size_t str_bytes;
+
+							binder_alloc_copy_from_buffer(&target_proc->alloc, &len, t->buffer, offset, sizeof(len));
+
+							if (len < 0 || len > 256) {
+								if (len < 0) offset += 4; /* Binder represents null strings as -1 */
+								else break; /* Malformed or non-string parcel: safely stop */
+								continue;
+						}
+
+							/* Calculate exact string block size including null terminator and 4-byte alignment padding */
+							str_bytes = ((len + 1) * 2 + 3) & ~3;
+							if (offset + 4 + str_bytes > tr->data_size) break;
+
+							if (len >= 7 && len <= 128) {
+								u16 chars[128];
+								u16 first_char;
+
+								binder_alloc_copy_from_buffer(&target_proc->alloc, chars, t->buffer, offset + 4, len * 2);
+								first_char = chars[0];
+
+								/* FAST-PATH REJECT */
+								if (first_char == 'p' || first_char == 'l' || first_char == 'v') {
+									bool match = false;
+									if (len == 7 && !memcmp(chars, s_profile, 14)) match = true;
+									else if (len >= 7 && !memcmp(chars, s_lineage, 14)) match = true;
+									else if (len >= 14 && !memcmp(chars, s_vendor_lineage, 28)) match = true;
+
+								if (match) {
+									int32_t i;
+									for (i = 0; i < len; i++) {
+										chars[i] = (i < 7) ? s_dummy[i] : '0';
+									}
+									/* 4.14 SAFE: Write ONLY the modified string back */
+									binder_alloc_copy_to_buffer(&target_proc->alloc, t->buffer, offset + 4, chars, len * 2);
+								}
+							}
+						}
+
+						offset += 4 + str_bytes;
+					}
+				}
+			}
+		}
+	}
+}
 	if (binder_alloc_copy_user_to_buffer(
 				&target_proc->alloc,
 				t->buffer,
